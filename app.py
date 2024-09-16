@@ -1,43 +1,61 @@
-import streamlit as st
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 from langchain_community.chat_models import ChatOllama
 from langchain_community.utilities import SQLDatabase
 from langchain_core.prompts import ChatPromptTemplate
+import logging
+from functools import lru_cache
 
+app = Flask(__name__)
+CORS(app)
 
-def connectDatabase(username, port, host, password, database):
-    mysql_uri = f"mysql+mysqlconnector://{username}:{password}@{host}:{port}/{database}"
-    st.session_state.db = SQLDatabase.from_uri(mysql_uri)
+logging.basicConfig(level=logging.INFO)
 
+def connectDatabase():
+    try:
+        mysql_uri = "mysql+mysqlconnector://root:root@localhost:3306/rag_test"
+        db = SQLDatabase.from_uri(mysql_uri)
+        logging.info("Database connected")
+        tables = db.get_table_names()
+        logging.info(f"Tables in the database: {tables}")
+        return db
+    except Exception as e:
+        logging.error(f"Failed to connect to the database: {str(e)}")
+        return None
 
-def runQuery(query):
-    return st.session_state.db.run(query) if st.session_state.db else "Please connect to database"
+@lru_cache(maxsize=128)  # Caching for repeated queries
+def runQuery(db, query):
+    if not query:
+        return "No valid SQL query was generated."
+    try:
+        return db.run(query)
+    except Exception as e:
+        return f"An error occurred: {str(e)}"
 
+def getDatabaseSchema(db):
+    return db.get_table_info() if db else "Please connect to database"
 
-def getDatabaseSchema():
-    return st.session_state.db.get_table_info() if st.session_state.db else "Please connect to database"
+llm = ChatOllama(model="llama2")
 
-
-llm = ChatOllama(model="llama3")
-
-
-def getQueryFromLLM(question):
-    template = """below is the schema of MYSQL database, read the schema carefully about the table and column names. Also take care of table or column name case sensitivity.
+@lru_cache(maxsize=128)
+def getQueryFromLLM(question, schema):
+    template = """Below is the schema of MYSQL database, read the schema carefully about the table and column names. Also take care of table or column name case sensitivity.
+    The available tables are: Album, Artist, Customer, Employee, Genre, Invoice, InvoiceLine, MediaType, Playlist, PlaylistTrack, and Track.
     Finally answer user's question in the form of SQL query.
 
     {schema}
 
-    please only provide the SQL query and nothing else
+    Please only provide the SQL query and nothing else
 
-    for example:
+    For example:
     question: how many albums we have in database
-    SQL query: SELECT COUNT(*) FROM album
+    SQL query: SELECT COUNT(*) FROM Album;
     question: how many customers are from Brazil in the database ?
-    SQL query: SELECT COUNT(*) FROM customer WHERE country=Brazil
+    SQL query: SELECT COUNT(*) FROM Customer WHERE Country='Brazil';
 
-    your turn :
+    Your turn:
     question: {question}
-    SQL query :
-    please only provide the SQL query and nothing else
+    SQL query:
     """
 
     prompt = ChatPromptTemplate.from_template(template)
@@ -45,104 +63,60 @@ def getQueryFromLLM(question):
 
     response = chain.invoke({
         "question": question,
-        "schema": getDatabaseSchema()
+        "schema": schema
     })
-    return response.content
+    
+    return extract_sql_query(response.content)
 
+def extract_sql_query(text):
+    keywords = ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP']
+    for keyword in keywords:
+        if keyword in text.upper():
+            start = text.upper().index(keyword)
+            query = text[start:].split(';')[0].strip() + ';'
+            query = query.replace('User', 'Customer').replace('user', 'Customer')
+            return query
+    return ""
 
 def getResponseForQueryResult(question, query, result):
-    template2 = """below is the schema of MYSQL database, read the schema carefully about the table and column names of each table.
-    Also look into the conversation if available
-    Finally write a response in natural language by looking into the conversation and result.
+    template = """
+    Question: {question}
+    SQL Query: {query}
+    Result: {result}
 
-    {schema}
-
-    Here are some example for you:
-    question: how many albums we have in database
-    SQL query: SELECT COUNT(*) FROM album;
-    Result : [(34,)]
-    Response: There are 34 albums in the database.
-
-    question: how many users we have in database
-    SQL query: SELECT COUNT(*) FROM customer;
-    Result : [(59,)]
-    Response: There are 59 amazing users in the database.
-
-    question: how many users above are from india we have in database
-    SQL query: SELECT COUNT(*) FROM customer WHERE country=india;
-    Result : [(4,)]
-    Response: There are 4 amazing users in the database.
-
-    your turn to write response in natural language from the given result :
-    question: {question}
-    SQL query : {query}
-    Result : {result}
+    Please provide a concise and relevant response to the question based on the SQL query result.
     Response:
     """
 
-    prompt2 = ChatPromptTemplate.from_template(template2)
-    chain2 = prompt2 | llm
+    prompt = ChatPromptTemplate.from_template(template)
+    chain = prompt | llm
 
-    response = chain2.invoke({
+    response = chain.invoke({
         "question": question,
-        "schema": getDatabaseSchema(),
         "query": query,
         "result": result
     })
 
     return response.content
 
+@app.route('/api/chat', methods=['POST'])
+def chat():
+    data = request.json
+    question = data.get('question')
 
-st.set_page_config(
-    page_icon="🤖",
-    page_title="Chat with MYSQL DB",
-    layout="centered"
-)
+    if not question:
+        return jsonify({"error": "No question provided"}), 400
 
-question = st.chat_input('Chat with your mysql database')
+    db = connectDatabase()
+    if not db:
+        return jsonify({"error": "Failed to connect to the database"}), 500
 
-if "chat" not in st.session_state:
-    st.session_state.chat = []
+    schema = getDatabaseSchema(db)
+    query = getQueryFromLLM(question, schema)
+    result = runQuery(db, query)
+    response = getResponseForQueryResult(question, query, result)
 
-if question:
-    if "db" not in st.session_state:
-        st.error('Please connect database first.')
-    else:
-        st.session_state.chat.append({
-            "role": "user",
-            "content": question
-        })
+    return jsonify({"response": response})
 
-        query = getQueryFromLLM(question)
-        print(query)
-        result = runQuery(query)
-        print(result)
-        response = getResponseForQueryResult(question, query, result)
-        st.session_state.chat.append({
-            "role": "assistant",
-            "content": response
-        })
-
-for chat in st.session_state.chat:
-    st.chat_message(chat['role']).markdown(chat['content'])
-
-with st.sidebar:
-    st.title('Connect to database')
-    st.text_input(label="Host", key="host", value="localhost")
-    st.text_input(label="Port", key="port", value="3306")
-    st.text_input(label="Username", key="username", value="root")
-    st.text_input(label="Password", key="password", value="", type="password")
-    st.text_input(label="Database", key="database", value="rag_test")
-    connectBtn = st.button("Connect")
-
-
-if connectBtn:
-    connectDatabase(
-        username=st.session_state.username,
-        port=st.session_state.port,
-        host=st.session_state.host,
-        password=st.session_state.password,
-        database=st.session_state.database,
-    )
-
-    st.success("Database connected")
+if __name__ == '__main__':
+    app.run(debug=True)
